@@ -29,16 +29,52 @@ from qiskit.quantum_info import Statevector
 from qiskit_aer import AerSimulator
 
 
+def build_lnn_iqft(num_qubits: int) -> QuantumCircuit:
+    """Build an inverse Quantum Fourier Transform using strictly linear nearest-neighbor gates.
+
+    Implements the Fowler et al. (2004) / Woolfe et al. (2014) LNN QFT scheme.
+    Each non-local controlled-phase gate CP(θ) is interleaved with a SWAP gate,
+    rippling the active qubit across adjacent physical wires.
+    This eliminates all long-range entangling gates, making the readout stage
+    optimal for 1D Matrix Product State (MPS) tensor network contractions.
+
+    Note that the final physical qubit positions are reversed relative to the input
+    logical wires. Physical wire `k` holds logical qubit `num_qubits - 1 - k`.
+    """
+    qc = QuantumCircuit(num_qubits, name="lnn_iqft")
+    phys_to_log = list(range(num_qubits))
+
+    for j in range(num_qubits):
+        if j == 0:
+            qc.h(0)
+        else:
+            for step in range(j, 0, -1):
+                p_act = step
+                p_nbr = step - 1
+                log_nbr = phys_to_log[p_nbr]
+                angle = -np.pi / (2 ** (j - log_nbr))
+                qc.cp(angle, p_act, p_nbr)
+                qc.swap(p_act, p_nbr)
+                phys_to_log[p_act], phys_to_log[p_nbr] = phys_to_log[p_nbr], phys_to_log[p_act]
+            qc.h(0)
+
+    return qc
+
+
 class QiskitSimulator:
     """Sample-based DQGM circuit simulator built on Qiskit Aer.
 
     Parameters
     ----------
     model : Model instance — provides qubit counts and gate connectivity.
+    use_lnn_qft : bool, default False.
+        If True, synthesizes the inverse QFT with linear nearest-neighbor (LNN)
+        connectivity using interleaved SWAP gates (Woolfe et al. / Fowler et al.).
     """
 
-    def __init__(self, model, *args, **kwargs):
+    def __init__(self, model, use_lnn_qft: bool = False, *args, **kwargs):
         self.model = model
+        self.use_lnn_qft = use_lnn_qft
 
     # ------------------------------------------------------------------
     # Circuit construction
@@ -58,8 +94,14 @@ class QiskitSimulator:
         for i in range(self.model.num_feature):
             vis_start = i * self.model.num_visible_per_feature
             ancilla_start = n_qubits + i * num_upsampling
-            qargs.extend(range(ancilla_start, ancilla_start + num_upsampling))
-            qargs.extend(range(vis_start, vis_start + self.model.readout_size))
+            wires = [
+                *range(ancilla_start, ancilla_start + num_upsampling),
+                *range(vis_start, vis_start + self.model.readout_size),
+            ]
+            if self.use_lnn_qft:
+                qargs.extend([wires[len(wires) - 1 - k] for k in range(len(wires))])
+            else:
+                qargs.extend(wires)
         return qargs
 
     def _build_circuit(
@@ -136,12 +178,15 @@ class QiskitSimulator:
                     circuit.measure(i, i)
         else:
             iqft_size = self.model.readout_size + num_upsampling
-            inv_qft = QFT(
-                num_qubits=iqft_size,
-                inverse=True,
-                do_swaps=False,
-                insert_barriers=False,
-            )
+            if self.use_lnn_qft:
+                inv_qft = build_lnn_iqft(iqft_size)
+            else:
+                inv_qft = QFT(
+                    num_qubits=iqft_size,
+                    inverse=True,
+                    do_swaps=False,
+                    insert_barriers=False,
+                )
             for i in range(self.model.num_feature):
                 vis_start     = i * self.model.num_visible_per_feature
                 ancilla_start = n_qubits + i * num_upsampling
@@ -161,7 +206,8 @@ class QiskitSimulator:
                         *range(ancilla_start, ancilla_start + num_upsampling),
                         *range(vis_start, vis_start + self.model.readout_size),
                     ]
-                    for q in wires:
+                    for k in range(len(wires)):
+                        q = wires[len(wires) - 1 - k] if self.use_lnn_qft else wires[k]
                         circuit.measure(q, counter)
                         counter += 1
 

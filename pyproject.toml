@@ -21,5 +21,10 @@ dependencies = [
     "tqdm>=4.6",
 ]
 
+[project.optional-dependencies]
+maestro = [
+    "qoro-maestro>=0.3.5",
+]
+
 [tool.setuptools]
 packages = ["dqgm"]
